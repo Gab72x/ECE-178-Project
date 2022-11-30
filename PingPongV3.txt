@@ -1,0 +1,209 @@
+#include "Altera_UP_SD_Card_Avalon_Interface.h"
+#include "stdio.h"
+#include "sys/alt_stdio.h"
+#include <time.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <math.h>
+#include "altera_avalon_pio_regs.h"
+#include "altera_avalon_timer_regs.h"
+#include "sys/alt_irq.h"
+#include "system.h"
+#include "io.h"
+#include "altera_avalon_pio_regs.h"
+#include <sys/alt_irq.h>
+
+// UART_RXD = INPUT
+// UART_TXD = OUTPUT
+
+// Global Variables
+volatile int edge_capture;
+int count;
+int data = 0;
+int select = 0;
+int shiftVal = 1;
+
+// Addr Variables
+volatile *const TXD = (void*)0x2450;
+volatile *const RXD = (void*)0x2460;
+
+// Prototype Functions
+static void handle_button_interrupts(void* context);
+static void timer_isr(void* context);
+static void uart_isr(void* context);
+
+static void init_timer(){
+	alt_u32 period = HIGH_RES_TIMER_LOAD_VALUE * 1000;
+	alt_u16 periodl = period & 0xFFFF;
+	alt_u16 periodh = period >> 0x10;
+
+	IOWR_ALTERA_AVALON_TIMER_STATUS(HIGH_RES_TIMER_BASE, 0);
+	IOWR_ALTERA_AVALON_TIMER_CONTROL(HIGH_RES_TIMER_BASE, 0x7);
+	IOWR_ALTERA_AVALON_TIMER_PERIODL(HIGH_RES_TIMER_BASE, periodl);
+	IOWR_ALTERA_AVALON_TIMER_PERIODH(HIGH_RES_TIMER_BASE, periodh);
+
+	// register the Timer ISR
+	alt_irq_register(HIGH_RES_TIMER_IRQ, 0, timer_isr);
+}
+
+static void timer_isr(void* context){
+
+	// 131072
+
+		if (count < 18 && select == 0){
+			//display = LUT[count]; // convert current count to seg7 representation
+			IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, shiftVal); // display on seg7
+			count++; // add by 1
+			shiftVal = shiftVal << 1;
+
+
+			if (count > 18){
+				IOWR_ALTERA_AVALON_PIO_DATA(UART_TXD_BASE, 0b1);
+				IOWR_ALTERA_AVALON_PIO_DATA(UART_TXD_BASE, 0b0);
+				data = IORD_ALTERA_AVALON_PIO_DATA(UART_RXD_BASE);
+				printf("TXD High \n");
+
+				/*
+				if (data == 1){
+					select = 1;
+					IOWR_ALTERA_AVALON_PIO_DATA(UART_TXD_BASE, 0b0);
+					printf("TXD Low \n");
+				} // */
+			}
+
+		} else if(count > 0 && select == 1){
+
+			printf("TXD Low \n");
+
+			IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, shiftVal);
+			count--; // subtract by 1
+			shiftVal = shiftVal >> 1;
+
+			if (count <= 0){
+				select = 0;
+			}
+		}
+
+	// Write to reset the status timer
+	IOWR_ALTERA_AVALON_TIMER_STATUS(HIGH_RES_TIMER_BASE, 0);
+
+	// Read the PIO to delay ISR exit
+	IORD_ALTERA_AVALON_TIMER_STATUS(HIGH_RES_TIMER_BASE);
+}
+
+static void init_button_pio(){
+	void* edge_capture_ptr = (void*)&edge_capture;
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(KEYS_BASE, 0xF);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE, 0x0);
+
+    alt_irq_register(KEYS_IRQ, edge_capture_ptr, handle_button_interrupts);
+
+	printf("Button Registered. \n");
+}
+
+static void handle_button_interrupts(void* context){
+
+	volatile int* edge_capture_ptr = (volatile int*) context;
+
+	*edge_capture_ptr = IORD_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE);
+
+	// START ISR
+	if (*edge_capture_ptr == 4){
+		KEY2_ISR();
+	}
+
+	// STOP ISR
+	if (*edge_capture_ptr == 2){
+		KEY1_ISR();
+	}
+
+	// CLEAR ISR
+	if (*edge_capture_ptr == 1){
+		KEY0_ISR();
+	}
+
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE, 0);
+
+	IORD_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE);
+}
+
+void KEY0_ISR(){
+
+	printf("KEY0 Entered. \n");
+	IOWR_ALTERA_AVALON_PIO_DATA(UART_TXD_BASE, 0b1);
+
+}
+
+void KEY1_ISR(){
+	printf("KEY1 Entered. \n");
+	IOWR_ALTERA_AVALON_PIO_DATA(UART_TXD_BASE, 0b0);
+
+}
+
+void KEY2_ISR(){
+	alt_u32 period = HIGH_RES_TIMER_LOAD_VALUE * 250;
+	alt_u16 periodl = period & 0xFFFF;
+	alt_u16 periodh = period >> 0x10;
+
+	IOWR_ALTERA_AVALON_TIMER_STATUS(HIGH_RES_TIMER_BASE, 0);
+	IOWR_ALTERA_AVALON_TIMER_PERIODL(HIGH_RES_TIMER_BASE, periodl);
+	IOWR_ALTERA_AVALON_TIMER_PERIODH(HIGH_RES_TIMER_BASE, periodh);
+	IOWR_ALTERA_AVALON_TIMER_CONTROL(HIGH_RES_TIMER_BASE, 0x7);
+}
+
+// UART Interrupt
+static void init_uart(){
+
+	void* edge_capture_ptr = (void*)&edge_capture;
+
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(UART_RXD_BASE, 0xF);
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(UART_RXD_BASE, 0x0);
+
+	alt_irq_register(UART_RXD_IRQ, edge_capture_ptr, uart_isr);
+
+	printf("UART Set: \n");
+}
+
+static void uart_isr(void* context){
+	volatile int* edge_capture_ptr = (volatile int*) context;
+	*edge_capture_ptr = IORD_ALTERA_AVALON_PIO_EDGE_CAP(UART_RXD_BASE);
+
+	select = 1;
+	//IOWR_ALTERA_AVALON_TIMER_CONTROL(HIGH_RES_TIMER_BASE, 0x07);
+	printf("RECEIVED\n");
+	//IOWR_ALTERA_AVALON_PIO_DATA(LEDG_BASE, 1);
+
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(UART_RXD_BASE, 0);
+	IORD_ALTERA_AVALON_PIO_EDGE_CAP(UART_RXD_BASE);
+}
+
+int main()
+{
+  printf("Hello from Nios II!\n");
+
+  init_uart();
+  init_button_pio();
+  init_timer();
+
+  // Reset PIOs on startup
+  IOWR_ALTERA_AVALON_PIO_DATA(UART_TXD_BASE, 0b0);
+  //RXD = 0;
+  //*RXD = 0;
+  //*TXD = 0;
+  IOWR_ALTERA_AVALON_PIO_DATA(UART_RXD_BASE, 0b0);
+  IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, 0);
+  IOWR_ALTERA_AVALON_PIO_DATA(LEDGS_BASE, 0);
+
+
+  for(;;){
+	  int rec = IORD_ALTERA_AVALON_PIO_DATA(UART_RXD_BASE);
+
+	  if (rec == 1){
+		  IOWR_ALTERA_AVALON_PIO_DATA(LEDGS_BASE, 0b10);
+	  } else {
+		  IOWR_ALTERA_AVALON_PIO_DATA(LEDGS_BASE, 0b0);
+	  }
+  }
+
+  return 0;
+}
