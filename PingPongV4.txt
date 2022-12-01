@@ -1,0 +1,646 @@
+#include <stdio.h>
+#include <system.h>
+#include <math.h>
+#include <sys/alt_irq.h>
+#include <altera_avalon_pio_regs.h>
+#include <altera_avalon_timer_regs.h>
+#include "altera_avalon_timer.h"
+#include <altera_avalon_lcd_16207.h>
+#include <altera_avalon_lcd_16207_regs.h>
+
+// Interrupt Pointers
+volatile int edge_capture;
+volatile const *rxd = (void*) 0x2440;
+volatile const *txd = (void*) 0x2450;
+
+// LUTs
+static int SevenSegment_values[10] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+static int dispnums[] =  {0b01000000, 0b01111001, 0b00100100, 0b00110000, 0b00011001, 0b00010010, 0b00000010, 0b01111000, 0b10000000, 0b00010000};
+
+// Prototype Functions
+static void keys_isr(void* context);
+static void timer_isr(void* context);
+static void timer2_isr(void* conteExt);
+static void uart_isr(void* context);
+
+// ------------------------------------GLOBAL VARIABLES----------------------------------
+
+// Misc. Variables
+alt_u16 myside;
+alt_u32 ledr;
+static alt_u8 increm = 1;
+static int clearlcd = 1;
+static alt_8 gameready = 0;
+
+// PIO Variables
+int switchVal;		// Check current switch value
+int LEDR_val;		// Check current status of LEDR
+int ledr_rst = 0;	// Reset LEDR based on position
+
+// Game Setting Variables
+int pause = 1;		// Pause if 0, unpause if 1
+int position; 		// If 0 (left) or 1 (right)
+int host;			// If 0 (!host) or 1 (host)
+
+// Scores
+int LeftScore = 0;
+int RightScore = 0;
+int hits = 0;
+
+
+/////////////////////////////------SETUPS-------///////////////////////////////////////
+//--------------------------------KEY SETUP--------------------------------------
+static void init_button_pio(){
+	void* edge_capture_ptr = (void*)&edge_capture;
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(KEYS_BASE, 0xF);
+    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE, 0x0);
+    alt_irq_register(KEYS_IRQ, edge_capture_ptr, keys_isr);
+
+	printf("Keys Interrupts Registered: \n");
+}
+
+//-------------------------------UART INIT--------------------------------------------
+static void init_uart(){
+		void* edge_capture_ptr = (void*)&edge_capture;
+
+		IOWR_ALTERA_AVALON_PIO_IRQ_MASK(UART_R_BASE, 0xF);	// Might need to be 0b1
+	    IOWR_ALTERA_AVALON_PIO_EDGE_CAP(UART_R_BASE, 0x0);
+
+	    alt_irq_register(UART_R_IRQ, edge_capture_ptr, uart_isr);
+
+	    printf("UART Set: \n");
+}
+
+//------------------------------Initialize Timer------------------------------------
+static void init_timer(){
+
+	alt_u32 period = (SYSTEM_TIMER_LOAD_VALUE * 250);	// 250ms timer
+	alt_u16 periodl = period & 0xFFFF;
+	alt_u16 periodh = period >> 0x10;
+
+	IOWR_ALTERA_AVALON_TIMER_STATUS(SYSTEM_TIMER_BASE, 0);
+	IOWR_ALTERA_AVALON_TIMER_PERIODL(SYSTEM_TIMER_BASE, periodl);
+	IOWR_ALTERA_AVALON_TIMER_PERIODH(SYSTEM_TIMER_BASE, periodh);
+	IOWR_ALTERA_AVALON_TIMER_CONTROL(SYSTEM_TIMER_BASE, 0x0B);
+
+	alt_irq_register( SYSTEM_TIMER_IRQ, 0, timer_isr);
+
+	printf("System Timer Set: \n");
+}
+
+//--------------------------Initialize High Res Timer-------------------------------
+static void init_timer2(){
+	alt_u32 period = HIGH_RES_TIMER_LOAD_VALUE;	// 1ms timer
+	alt_u16 periodl = period & 0xFFFF;
+	alt_u16 periodh = period >> 0x10;
+
+	IOWR_ALTERA_AVALON_TIMER_STATUS(HIGH_RES_TIMER_BASE, 0);
+	IOWR_ALTERA_AVALON_TIMER_PERIODL(HIGH_RES_TIMER_BASE, periodl);
+	IOWR_ALTERA_AVALON_TIMER_PERIODH(HIGH_RES_TIMER_BASE, periodh);
+	IOWR_ALTERA_AVALON_TIMER_CONTROL(HIGH_RES_TIMER_BASE, 0x0B);
+
+	alt_irq_register(HIGH_RES_TIMER_IRQ, 0, timer2_isr);
+
+	printf("High Res Set: \n");
+}
+
+
+/////////////////////////////------ISRS-------///////////////////////////////////////
+//---------------------- System Timer ISR----------------------------------------
+static void timer_isr(void* context){
+	printf("System Timer ISR: \n");
+
+	// Board is placed on LEFT position
+	if (position == 0){
+
+		printf("LEFT position entered. \n");
+
+		// If RESET is 1 && Position is LEFT, LEDR is set to LEDR0
+		if (ledr_rst == 1){
+			ledr = 1;
+			ledr_rst = 0;
+		}
+
+		IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, ledr);
+
+		// Check if ball is on my side
+		if (myside == 1){
+
+			if (increm == 1){
+
+				ledr = ledr << 1; 	// shift LEDR left by one
+
+				// if LEDR reaches LEDR17 shift right
+				if (ledr > 131720){
+					increm = 0;
+				}
+
+
+			} else if (increm == 0){
+
+				ledr = ledr >> 1;	// shift LEDR right by one
+
+				if (ledr < 1){
+
+					increm = 1;
+					myside = 0;
+
+					IOWR_ALTERA_AVALON_PIO_DATA(UART_T_BASE, 0b1);
+					delayshort();
+					IOWR_ALTERA_AVALON_PIO_DATA(UART_T_BASE, 0b0);
+
+				}
+
+			}
+
+		} else if (myside == 0){
+			printf("Not on my side. \n");
+		}
+
+	// Board is placed on RIGHT position
+	} else if (position == 1){
+
+		// If RESET is 1 && Position is RIGHT, LEDR is set to LEDR17
+		if (ledr_rst == 1){
+			ledr = 131072;
+			ledr_rst = 0;
+		}
+
+		IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, ledr);
+
+		if (myside == 1){
+
+			if (increm == 1){
+
+				ledr = ledr >> 1; 	// shift LEDR right by one
+
+				// If LEDR reaches LEDR0 shift left
+				if (ledr <= 1){
+					increm = 0;
+				}
+
+			} else if (increm == 0){
+
+				ledr = ledr << 1;	// shift LEDR left by one
+
+				if (ledr > 262144){
+
+					increm = 1;
+					myside = 0;
+					ledr_rst = 1;
+
+					IOWR_ALTERA_AVALON_PIO_DATA(UART_T_BASE, 0b1);	// TXD high to send ball
+					delayshort();
+					IOWR_ALTERA_AVALON_PIO_DATA(UART_T_BASE, 0b0);
+
+				} // end of ledr < 1 check
+
+			} // end of increm == 0 check
+
+		} else if (myside == 0){
+			printf("Not on my side. \n");
+		} // end of my side check
+
+	} // end of position check
+
+
+	//-------------------------- OLD CODE BELOW ----------------------------------
+
+
+	/*
+	if (myside == 1) {
+		IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, ledr);
+		if (increm == 1) {
+			ledr = ledr << 1;
+			printf("shift left\n");
+			if ( ledr > 0b10000000000000000) increm = 0;
+		}
+		else if (increm == 0){
+			ledr = ledr >> 1;
+			printf("shift right\n");
+			if(ledr < 1) {
+				increm = 1;
+				myside = 0;
+				IOWR_ALTERA_AVALON_PIO_DATA(UART_T_BASE, 0b1);
+				delayshort();
+				IOWR_ALTERA_AVALON_PIO_DATA(UART_T_BASE, 0b0);
+			}
+		}
+	}
+	else if (myside == 0){
+		IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, 0);
+		printf("not my side\n");
+	} // */
+
+	//IOWR_ALTERA_AVALON_TIMER_CONTROL(SYSTEM_TIMER_BASE, 0xB); // Stop Timer
+
+	IOWR_ALTERA_AVALON_TIMER_STATUS(SYSTEM_TIMER_BASE, 0);
+	IORD_ALTERA_AVALON_TIMER_STATUS(SYSTEM_TIMER_BASE);
+}
+
+ //-----------------------------High Res Timer ISR------------------------------------
+static void timer2_isr(void* context){
+	printf("High Res Timer ISR:  \n");
+
+	IOWR_ALTERA_AVALON_TIMER_STATUS(HIGH_RES_TIMER_BASE, 0);
+	IORD_ALTERA_AVALON_TIMER_STATUS(HIGH_RES_TIMER_BASE);
+}
+
+//--------------------------------UART ISR --------------------------------------
+static void uart_isr(void* context){
+	volatile int* edge_capture_ptr = (volatile int*) context;
+	*edge_capture_ptr = IORD_ALTERA_AVALON_PIO_EDGE_CAP(UART_R_BASE);
+
+
+	// Rework Interrupt ISR
+	myside = 1;
+	ledr_rst = 1;
+	IOWR_ALTERA_AVALON_TIMER_CONTROL(SYSTEM_TIMER_BASE, 0x07);
+
+	printf("RECEIVED\n");
+
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(UART_R_BASE, 0);
+	IORD_ALTERA_AVALON_PIO_EDGE_CAP(UART_R_BASE);
+}
+
+//-------------------------------------- KEY ISR-------------------------------------
+static void keys_isr(void* context){
+
+	volatile int* edge_capture_ptr = (volatile int*) context;
+	*edge_capture_ptr = IORD_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE);
+
+
+	switchVal = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCHES_BASE);
+
+	if (switchVal == 0b1){
+
+		// Game settings
+
+		// KEY3
+		if (*edge_capture_ptr == 8){
+			key3_isr();
+		}
+
+		// KEY2
+		if (*edge_capture_ptr == 4){
+			key2_isr();
+		}
+
+		// KEY1
+		if (*edge_capture_ptr == 2){
+			key1_isr();
+		}
+
+		// KEY0
+		if (*edge_capture_ptr == 1){
+			key0_isr();
+		}
+
+
+	} else if (switchVal == 0b0){
+
+		// Game Controls
+
+		if (*edge_capture_ptr == 4){
+			START_ISR();
+		}
+
+		if (*edge_capture_ptr == 2){
+			PAUSE_ISR();
+		}
+
+		if (*edge_capture_ptr == 1){
+			HIT_ISR();
+		}
+
+	}
+
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE, 0);
+	IORD_ALTERA_AVALON_PIO_EDGE_CAP(KEYS_BASE);
+}
+
+//--------------------------------START ISR -------------------------------------
+void START_ISR(){
+	printf("Start ISR entered. \n");
+
+	alt_u32 period = SYSTEM_TIMER_LOAD_VALUE * 250;
+	alt_u16 periodl = period & 0xFFFF;
+	alt_u16 periodh = period >> 0x10;
+
+	IOWR_ALTERA_AVALON_TIMER_STATUS(SYSTEM_TIMER_BASE, 0);
+	IOWR_ALTERA_AVALON_TIMER_PERIODL(SYSTEM_TIMER_BASE, periodl);
+	IOWR_ALTERA_AVALON_TIMER_PERIODH(SYSTEM_TIMER_BASE, periodh);
+	IOWR_ALTERA_AVALON_TIMER_CONTROL(SYSTEM_TIMER_BASE, 0x7);
+
+	myside = 1; 	// My side is 1 to initialize the game
+	ledr_rst = 1; 	// Set RESET to high?
+}
+
+//--------------------------------PAUSE ISR -------------------------------------
+void PAUSE_ISR(){
+	printf("Pause ISR entered. \n");
+
+	if (pause == 1){
+		IOWR_ALTERA_AVALON_TIMER_CONTROL(SYSTEM_TIMER_BASE, 0x7); // Starts Timer
+		pause = 0;
+
+	} else if (pause == 0){
+		IOWR_ALTERA_AVALON_TIMER_CONTROL(SYSTEM_TIMER_BASE, 0xB); // Stops Timer
+		pause = 1;
+	}
+}
+
+//--------------------------------HIT ISR ---------------------------------------
+void HIT_ISR(){
+	printf("Hit ISR entered. \n");
+
+	LEDR_val = IORD_ALTERA_AVALON_PIO_DATA(LEDS_BASE);
+	// NOTE: likely add some variables to track number of hits
+
+
+	// Organize by Player being left or right
+	if (position == 0){
+
+		// This board is place on LEFT position
+
+		// If LEDR is equal to LEDR0 value
+		if (LEDR_val == 1){
+
+			hits++;
+			printf("Hit! \n");
+
+		} else {
+
+			LeftScore++;
+			printf("Miss! \n");
+
+		}
+
+
+	} else if (position == 1){
+
+		// This board is placed on RIGHT position
+
+		// If LEDR is equal to LEDR17 value
+		if (LEDR_val == 131072){
+
+			hits++;
+			printf("Hit! \n");
+
+		} else {
+
+			RightScore++;
+			printf("Miss! \n");
+
+		}
+
+	}
+
+	int mask = 0xFFFF;
+	int displayL = dispnums[LeftScore];
+	int displayR = dispnums[RightScore];
+
+	displayL = mask + displayL;
+	displayR = mask + displayR;
+
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEGMENT1_BASE, displayR);
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEGMENT2_BASE, displayL);
+
+
+}
+
+
+//--------------------------------KEY3 ISR --------------------------------------
+void key3_isr(){
+	if (clearlcd == 1){
+		IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b000001);
+		clearlcd = 0;
+	}
+
+	static int player =0;
+		if (player == 0){
+			 char lcd[8] = "Player 1";
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10000000);
+			 for (int i = 0; i<sizeof(lcd); i++){
+			 		delayp();
+			 		IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+			 }
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10000000);
+			 for (int i = 0; i<sizeof(lcd); i++){
+			 	delayp();
+			 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd[i]);
+			 }
+
+			player = 1;
+		}
+		else if (player == 1) {
+			 char lcd2[8] = "Player 2";
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10000000);
+			 for (int i = 0; i<sizeof(lcd2); i++){
+			 	delayp();
+			 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+			 }
+
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10000000);
+			 for (int i = 0; i<sizeof(lcd2); i++){
+			 		delayp();
+			 		IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd2[i]);
+			 }
+
+			player = 0;
+		}
+}
+
+//--------------------------------KEY2 ISR --------------------------------------
+void key2_isr(){
+	IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10001001);
+	delayp();
+	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0x2d);
+
+	delayp();
+	static int side =0;
+	if (side == 0){
+		 char lcd[5] = "Left ";
+		 delayp();
+		 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10001011);
+		 for (int i = 0; i<sizeof(lcd); i++){
+		 	delayp();
+		 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+		 }
+
+		 delayp();
+		 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10001011);
+		 for (int i = 0; i<sizeof(lcd); i++){
+		 		delayp();
+		 		IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd[i]);
+		 	}
+		side = 1;
+		position = 0;	// GLOBAL POSITION VARIABLE (LEFT)
+		printf("Position set to LEFT \n");
+	}
+	else if (side == 1) {
+		 char lcd2[5] = "Right";
+		 delayp();
+		 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10001011);
+		 for (int i = 0; i<sizeof(lcd2); i++){
+		 	delayp();
+		 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+		 }
+
+		 delayp();
+		 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10001011);
+		 for (int i = 0; i<sizeof(lcd2); i++){
+		 		delayp();
+		 		IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd2[i]);
+		 	}
+		side = 0;
+		position = 1;	// GLOBAL POSITION VARIABLE (RIGHT)
+		printf("Position set to RIGHT \n");
+	}
+}
+
+//--------------------------------KEY1 ISR --------------------------------------
+void key1_isr(){
+		static int hostguest =0;
+		if (hostguest == 0){
+			 char lcd[5] = "Host ";
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11000000);
+			 for (int i = 0; i<sizeof(lcd); i++){
+			 	delayp();
+			 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+			 }
+
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11000000);
+			 for (int i = 0; i<sizeof(lcd); i++){
+			 		delayp();
+			 		IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd[i]);
+			 	}
+			hostguest = 1;
+		}
+		else if (hostguest == 1) {
+			 char lcd2[5] = "Guest";
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11000000);
+			 for (int i = 0; i<sizeof(lcd2); i++){
+			 	delayp();
+			 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+			 }
+
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11000000);
+			 for (int i = 0; i<sizeof(lcd2); i++){
+			 		delayp();
+			 		IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd2[i]);
+			 	}
+			hostguest = 0;
+		}
+}
+//--------------------------------KEY0 ISR --------------------------------------
+void key0_isr(){
+	IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11000110);
+	delayp();
+	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0x2d);
+
+	delayp();
+	static int ready =0;
+	if (ready == 0){
+		char lcd[7] = "Waiting";
+		 delayp();
+		 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11001001);
+		 for (int i = 0; i<sizeof(lcd); i++){
+		 	delayp();
+		 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+		 }
+
+		delayp();
+		IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11001001);
+		for (int i = 0; i<sizeof(lcd); i++){
+			delayp();
+			IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd[i]);
+				 	}
+			ready = 1;
+			gameready = 0;
+		}
+		else if (ready == 1) {
+			char lcd2[7] = "Ready  ";
+			 delayp();
+			 IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11001001);
+			 for (int i = 0; i<sizeof(lcd2); i++){
+			 	delayp();
+			 	IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, 0);
+			 }
+
+			delayp();
+			IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11001001);
+			for (int i = 0; i<sizeof(lcd2); i++){
+				delayp();
+				IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd2[i]);
+			}
+			ready = 0;
+			gameready = 1;
+		}
+}
+
+void delay(){
+	int delay = 0;
+	while(delay<499999) delay++;
+}
+void delayp(){
+	int delay = 0;
+	while(delay<49999) delay++;
+}
+void delayshort(){
+	int delay = 0;
+	while(delay<29999) delay++;
+}
+
+int main(){
+
+	printf("Nios II Version 1.2 \n");
+	IOWR_ALTERA_AVALON_PIO_DATA(LEDS_BASE, 0);
+	IOWR_ALTERA_AVALON_PIO_DATA(LEDG_BASE, 0);
+	IOWR_ALTERA_AVALON_PIO_DATA(UART_R_BASE, 0);
+	IOWR_ALTERA_AVALON_PIO_DATA(UART_T_BASE, 0);
+
+	// NOTE: not sure why this isn't masking properly
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEGMENT1_BASE, 0xFFFFFFFF);
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEGMENT2_BASE, 0xFFFFFFFF);
+
+	init_button_pio();
+	init_uart();
+	init_timer();
+	init_timer2();
+
+
+
+			char lcd[] = "LOADING...";
+			char lcd2[] = "LOADING...";
+			IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b10000000);
+			for (int i = 0; i<sizeof(lcd)-1; i++){
+				delayshort();
+				IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd[i]);
+			}
+			delay();
+			IOWR_ALTERA_AVALON_LCD_16207_COMMAND(LCD_BASE, 0b11000000);
+			for (int i = 0; i<sizeof(lcd2)-1; i++){
+				delayshort();
+				IOWR_ALTERA_AVALON_LCD_16207_DATA(LCD_BASE, lcd2[i]);
+			}
+
+	while(1){
+		if (myside == 1)IOWR_ALTERA_AVALON_PIO_DATA(LEDG_BASE, 1);
+		else if (myside == 0) IOWR_ALTERA_AVALON_PIO_DATA(LEDG_BASE, 0b101);
+
+		int tra = IORD_ALTERA_AVALON_PIO_DATA(UART_T_BASE);
+		if (tra == 1) IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEGMENT1_BASE, dispnums[1]);
+		else if (tra == 0) IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEGMENT1_BASE, dispnums[0]);
+	}
+	return 0;
+}
+
